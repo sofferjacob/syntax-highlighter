@@ -1,0 +1,33 @@
+* {
+    background-color: rgb(3, 2, 37);
+    color: white;
+    font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+}
+
+pre {
+    font-family: 'Courier New', Courier, monospace;
+}
+
+span {
+    font-family: 'Courier New', Courier, monospace;
+}
+
+.kw {
+    color: rgb(122, 24, 220);
+}
+
+.st {
+    color: orange;
+}
+
+.tp {
+    color:rgb(240, 62, 234)
+}
+
+.op {
+    color: rgb(46, 117, 5);
+}
+
+.nm {
+    color: yellow
+}
