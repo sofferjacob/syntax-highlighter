@@ -1,458 +1,400 @@
-package routes
+package node
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"os"
+	"reflect"
+	"sort"
+	"testing"
 
-	"github.com/gin-gonic/gin"
-	"github.com/jkomyno/nanoid"
-	"github.com/sofferjacob/dashboard_api/db"
-	"github.com/sofferjacob/dashboard_api/ent"
-	"github.com/sofferjacob/dashboard_api/ent/googleoauthstate"
-	"github.com/sofferjacob/dashboard_api/ent/project"
-	"github.com/sofferjacob/dashboard_api/ent/source"
-	"github.com/sofferjacob/dashboard_api/tokens"
+	"github.com/stretchr/testify/assert"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-func GetProjectSources(c *gin.Context) {
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	sources, err := db.Client.Source.Query().Where(source.SourceProject(claims.ProjectId)).All(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"status": "ok", "sources": sources})
-}
-
-func DeleteSource(c *gin.Context) {
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	sourceId := c.Param("id")
-	if sourceId == "" {
-		c.JSON(400, gin.H{"error": "missing required param id"})
-		return
-	}
-	source, err := db.Client.Source.Query().Where(source.And(source.SourceProject(claims.ProjectId), source.ID(sourceId))).Only(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not fetch source", "message": err.Error()})
-		return
-	}
-	err = db.Client.Source.DeleteOne(source).Exec(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not delete source", "message": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"status": "ok"})
-}
-
-type CreateFacebookSourceParams struct {
-	AccountId   string `json:"accountId" binding:"required"`
-	AccessToken string `json:"accessToken" binding:"required"`
-	SourceName  string `json:"sourceName" binding:"required"`
-}
-
-type FBTokenResponse struct {
-	Token string `json:"access_token" binding:"required"`
-}
-
-func CreateFacebookSource(c *gin.Context) {
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	var params CreateFacebookSourceParams
-	if err := c.ShouldBindJSON(&params); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-	urlStr := fmt.Sprintf("https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=%v&client_secret=%v&fb_exchange_token=%v", os.Getenv("FB_APP_ID"), os.Getenv("FB_APP_SECRET"), params.AccessToken)
-	// fmt.Println(urlStr)
-	reqUrl, _ := url.Parse(urlStr)
-	req := &http.Request{
-		Method: "GET",
-		URL:    reqUrl,
-	}
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not trade token", "message": err.Error()})
-		return
-	}
-	responseData, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not read FB response", "message": err.Error()})
-		return
-	}
-	if response.StatusCode != 200 {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("could not trade token, invalid status code: %v response: %v", response.StatusCode, string(responseData))})
-		return
-	}
-	// fmt.Println(string(responseData))
-	var token FBTokenResponse
-	err = json.Unmarshal(responseData, &token)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not parse FB response", "message": err.Error()})
-		return
-	}
-	sourceId, _ := nanoid.Nanoid(10)
-	source, err := db.Client.Source.Create().SetID(sourceId).SetType("fb").SetProjectID(claims.ProjectId).SetConfig(gin.H{
-		"accountId":   params.AccountId,
-		"accessToken": token.Token,
-	}).SetName(params.SourceName).Save(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not create source", "message": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"status": "ok", "source": source})
-}
-
-type CreateGoogleSourceParams struct {
-	State string `json:"state" binding:"required"`
-	Code  string `json:"code" binding:"required"`
-}
-
-type GoogleResponse struct {
-	RefreshToken string `json:"refresh_token" binding:"required"`
-}
-
-func CreateGoogleSource(c *gin.Context) {
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	var params CreateGoogleSourceParams
-	if err := c.ShouldBindJSON(&params); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-	urlStr := fmt.Sprintf(
-		"https://oauth2.googleapis.com/token?code=%v&client_id=%v&client_secret=%v&grant_type=authorization_code&redirect_uri=%v",
-		params.Code,
-		os.Getenv("GA_CLIENT_ID"),
-		os.Getenv("GA_SECRET"),
-		os.Getenv("GA_REDIRECT_URI"),
-	)
-	reqUrl, _ := url.Parse(urlStr)
-	req := &http.Request{
-		Method: "POST",
-		URL:    reqUrl,
-	}
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not trade code", "message": err.Error()})
-		return
-	}
-	responseData, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not read GOOGLE response", "message": err.Error()})
-		return
-	}
-	if response.StatusCode != 200 {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("could not trade code, invalid status code: %v response: %v", response.StatusCode, string(responseData))})
-		return
-	}
-	var token GoogleResponse
-	err = json.Unmarshal(responseData, &token)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not parse google response", "message": err.Error()})
-		return
-	}
-	state, err := db.Client.GoogleOauthState.Query().Where(googleoauthstate.ID(params.State)).Only(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not fetch state", "message": err.Error()})
-		return
-	}
-	_ = db.Client.GoogleOauthState.DeleteOne(state).Exec(context.Background())
-	sourceId, _ := nanoid.Nanoid(10)
-	config := gin.H{
-		"refresh_token":       token.RefreshToken,
-		"customer_id":         state.CustomerID,
-		"manager_customer_id": state.ManagerID,
-	}
-	source, err := db.Client.Source.Create().
-		SetID(sourceId).
-		SetType("ga").
-		SetProjectID(claims.ProjectId).
-		SetConfig(config).
-		SetName(state.SourceName).
-		Save(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not create source", "message": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"status": "ok", "source": source})
-}
-
-type CreateCPSourceParams struct {
-	SourceName string `json:"source_name" binding:"required"`
-	Numbers    []struct {
-		Name   string `json:"name" binding:"required"`
-		Number string `json:"number" binding:"required"`
-	} `json:"numbers" binding:"required"`
-}
-
-func CreateCPSource(c *gin.Context) {
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	var params CreateCPSourceParams
-	if err := c.ShouldBindJSON(&params); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-	sourceId, _ := nanoid.Nanoid(10)
-	source, err := db.Client.Source.Create().
-		SetName(params.SourceName).
-		SetID(sourceId).
-		SetType("cp").
-		SetProjectID(claims.ProjectId).
-		SetConfig(gin.H{
-			"numbers": params.Numbers,
-		}).Save(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not create source", "message": err.Error()})
-	}
-	c.JSON(200, gin.H{"status": "ok", "source": source, "url": "https://dash.gbs-digital.com/t/cp"})
-}
-
-func notifyCpHook(body db.CallPickerRecord) {
-	data, err := json.Marshal(body)
-	if err != nil {
-		fmt.Printf("Could not post to CP hook: %v\n", err.Error())
-		return
-	}
-	_, err = http.Post("https://hooks.zapier.com/hooks/catch/6820014/bz8ghqa", "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		fmt.Printf("Could not post to CP hook: %v\n", err.Error())
-		return
-	}
-}
-
-func CPTransport(c *gin.Context) {
-	var body db.CallPickerRecord
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-	fmt.Println(body)
-	go notifyCpHook(body)
-	projectId, err := db.Transport.GetCPSourceProject(body.CpNumber)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "The project does not exist, is inactive or is not connected to Call Picker", "message": err.Error()})
-		fmt.Printf("Error: source not found: %v\n", err.Error())
-		return
-	}
-	err = db.Transport.InsertCpRecord(projectId, body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "could not insert record", "message": err.Error()})
-		fmt.Printf("Error: could not insert record: %v\n", err.Error())
-		return
-	}
-	c.JSON(200, gin.H{"status": "ok"})
-}
-
-func parseFbSource(v *ent.Source, sourcesObj gin.H) {
-	sourcesObj[fmt.Sprintf("%v_%v_%v", v.Name, v.Type, v.SourceProject)] = gin.H{
-		"type":         "facebook_marketing",
-		"destinations": []string{fmt.Sprintf("postgres_%v", v.SourceProject)},
-		"config": gin.H{
-			"account_id":   v.Config["accountId"],
-			"access_token": v.Config["accessToken"],
+func TestDeleteEdges_locked(t *testing.T) {
+	cases := []struct {
+		desc        string
+		fromType    vertexType
+		toType      vertexType
+		toNamespace string
+		toName      string
+		start       *Graph
+		expect      *Graph
+	}{
+		{
+			// single edge from a configmap to a node, will delete edge and orphaned configmap
+			desc:        "edges and source orphans are deleted, destination orphans are preserved",
+			fromType:    configMapVertexType,
+			toType:      nodeVertexType,
+			toNamespace: "",
+			toName:      "node1",
+			start: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap2")
+				nodeVertex := g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				configmapVertex := g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				g.graph.SetEdge(newDestinationEdge(configmapVertex, nodeVertex, nodeVertex))
+				return g
+			}(),
+			expect: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap2")
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				return g
+			}(),
 		},
-		"collections": []gin.H{
-			{
-				"name":     "ads",
-				"type":     "ads",
-				"level":    "ad",
-				"schedule": "*/20 * * * *",
-				"parameters": gin.H{
-					"fields": []string{"bid_amount", "adlabels", "creative", "status", "created_time", "updated_time", "targeting", "effective_status", "campaign_id", "adset_id", "conversion_specs", "recommendations", "id", "bid_info", "tracking_specs", "bid_type", "name", "account_id", "source_ad_id"},
-				},
-			},
-			{
-				"name":     "adset",
-				"type":     "ads",
-				"level":    "adset",
-				"schedule": "*/20 * * * *",
-				"parameters": gin.H{
-					"fields": []string{"bid_amount", "adlabels", "creative", "status", "created_time", "updated_time", "targeting", "effective_status", "campaign_id", "adset_id", "conversion_specs", "recommendations", "id", "bid_info", "tracking_specs", "bid_type", "name", "account_id", "source_ad_id"},
-				},
-			},
-			{
-				"name":     "campaign",
-				"type":     "ads",
-				"level":    "campaign",
-				"schedule": "*/30 * * * *",
-				"parameters": gin.H{
-					"fields": []string{"bid_amount", "adlabels", "creative", "status", "created_time", "updated_time", "targeting", "effective_status", "campaign_id", "adset_id", "conversion_specs", "recommendations", "id", "bid_info", "tracking_specs", "bid_type", "name", "account_id", "source_ad_id"},
-				},
-			},
-			{
-				"name":     "account",
-				"type":     "account",
-				"level":    "account",
-				"schedule": "*/60 * * * *",
-				"parameters": gin.H{
-					"fields": []string{"bid_amount", "adlabels", "creative", "status", "created_time", "updated_time", "targeting", "effective_status", "campaign_id", "adset_id", "conversion_specs", "recommendations", "id", "bid_info", "tracking_specs", "bid_type", "name", "account_id", "source_ad_id"},
-				},
-			},
+		{
+			// two edges from the same configmap to distinct nodes, will delete one of the edges
+			desc:        "edges are deleted, non-orphans and destination orphans are preserved",
+			fromType:    configMapVertexType,
+			toType:      nodeVertexType,
+			toNamespace: "",
+			toName:      "node2",
+			start: func() *Graph {
+				g := NewGraph()
+				nodeVertex1 := g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				nodeVertex2 := g.getOrCreateVertex_locked(nodeVertexType, "", "node2")
+				configmapVertex := g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				g.graph.SetEdge(newDestinationEdge(configmapVertex, nodeVertex1, nodeVertex1))
+				g.graph.SetEdge(newDestinationEdge(configmapVertex, nodeVertex2, nodeVertex2))
+				return g
+			}(),
+			expect: func() *Graph {
+				g := NewGraph()
+				nodeVertex1 := g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node2")
+				configmapVertex := g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				g.graph.SetEdge(newDestinationEdge(configmapVertex, nodeVertex1, nodeVertex1))
+				return g
+			}(),
+		},
+		{
+			desc:        "no edges to delete",
+			fromType:    configMapVertexType,
+			toType:      nodeVertexType,
+			toNamespace: "",
+			toName:      "node1",
+			start: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				return g
+			}(),
+			expect: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				return g
+			}(),
+		},
+		{
+			desc:        "destination vertex does not exist",
+			fromType:    configMapVertexType,
+			toType:      nodeVertexType,
+			toNamespace: "",
+			toName:      "node1",
+			start: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				return g
+			}(),
+			expect: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(configMapVertexType, "namespace1", "configmap1")
+				return g
+			}(),
+		},
+		{
+			desc:        "source vertex type doesn't exist",
+			fromType:    configMapVertexType,
+			toType:      nodeVertexType,
+			toNamespace: "",
+			toName:      "node1",
+			start: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				return g
+			}(),
+			expect: func() *Graph {
+				g := NewGraph()
+				g.getOrCreateVertex_locked(nodeVertexType, "", "node1")
+				return g
+			}(),
 		},
 	}
-}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			c.start.deleteEdges_locked(c.fromType, c.toType, c.toNamespace, c.toName)
 
-func parseGaSource(v *ent.Source, obj gin.H) {
-	obj[fmt.Sprintf("%v_%v_%v", v.Name, v.Type, v.SourceProject)] = gin.H{
-		"type":         "google_ads",
-		"destinations": []string{fmt.Sprintf("postgres_%v", v.SourceProject)},
-		"config": gin.H{
-			"customer_id":         v.Config["customer_id"],
-			"manager_customer_id": v.Config["manager_customer_id"],
-			"auth": gin.H{
-				"type":          "OAuth",
-				"client_id":     os.Getenv("GA_CLIENT_ID"),
-				"client_secret": os.Getenv("GA_SECRET"),
-				"refresh_token": v.Config["refresh_token"],
-			},
-		},
-		"schedule": "*/60 * * * *",
-		"collections": []gin.H{
-			{
-				"name":       "accessible_bidding_strategy",
-				"type":       "accessible_bidding_strategy",
-				"table_name": "gads_accessible_bidding_strategy",
-				"schedule":   "*/60 * * * *",
-				"parameters": gin.H{
-					"fields":     "accessible_bidding_strategy.id, accessible_bidding_strategy.maximize_conversion_value.target_roas, accessible_bidding_strategy.maximize_conversions.target_cpa, accessible_bidding_strategy.name, accessible_bidding_strategy.owner_customer_id, accessible_bidding_strategy.owner_descriptive_name, accessible_bidding_strategy.resource_name, accessible_bidding_strategy.target_cpa.target_cpa_micros, accessible_bidding_strategy.target_impression_share.cpc_bid_ceiling_micros, accessible_bidding_strategy.target_impression_share.location, accessible_bidding_strategy.target_impression_share.location_fraction_micros, accessible_bidding_strategy.target_roas.target_roas, accessible_bidding_strategy.target_spend.cpc_bid_ceiling_micros, accessible_bidding_strategy.target_spend.target_spend_micros, accessible_bidding_strategy.type",
-					"start_date": "2021-01-01",
-				},
-			},
-			{
-				"name":       "account_budget",
-				"type":       "account_budget",
-				"table_name": "gads_account_budget",
-				"schedule":   "*/60 * * * *",
-				"parameters": gin.H{
-					"fields":     "account_budget.adjusted_spending_limit_micros, account_budget.adjusted_spending_limit_type, account_budget.amount_served_micros, account_budget.approved_end_date_time, account_budget.approved_end_time_type, account_budget.approved_spending_limit_micros, account_budget.approved_spending_limit_type, account_budget.approved_start_date_time, account_budget.billing_setup, account_budget.id, account_budget.name, account_budget.notes, account_budget.pending_proposal.account_budget_proposal, account_budget.pending_proposal.creation_date_time, account_budget.pending_proposal.end_date_time, account_budget.pending_proposal.end_time_type, account_budget.pending_proposal.name, account_budget.pending_proposal.notes, account_budget.pending_proposal.proposal_type, account_budget.pending_proposal.purchase_order_number, account_budget.pending_proposal.spending_limit_micros, account_budget.pending_proposal.spending_limit_type, account_budget.pending_proposal.start_date_time, account_budget.proposed_end_date_time, account_budget.proposed_end_time_type, account_budget.proposed_spending_limit_micros, account_budget.proposed_spending_limit_type, account_budget.proposed_start_date_time, account_budget.purchase_order_number, account_budget.resource_name, account_budget.status, account_budget.total_adjustments_micros",
-					"start_date": "2021-01-01",
-				},
-			},
-			{
-				"name":       "account_budget_proposal",
-				"type":       "account_budget_proposal",
-				"table_name": "gads_account_budget_proposal",
-				"schedule":   "*/60 * * * *",
-				"parameters": gin.H{
-					"fields":     "account_budget_proposal.account_budget, account_budget_proposal.approval_date_time, account_budget_proposal.approved_end_date_time, account_budget_proposal.approved_end_time_type, account_budget_proposal.approved_spending_limit_micros, account_budget_proposal.approved_spending_limit_type, account_budget_proposal.approved_start_date_time, account_budget_proposal.billing_setup, account_budget_proposal.creation_date_time, account_budget_proposal.id, account_budget_proposal.proposal_type, account_budget_proposal.proposed_end_date_time, account_budget_proposal.proposed_end_time_type, account_budget_proposal.proposed_name, account_budget_proposal.proposed_notes, account_budget_proposal.proposed_purchase_order_number, account_budget_proposal.proposed_spending_limit_micros, account_budget_proposal.proposed_spending_limit_type, account_budget_proposal.proposed_start_date_time, account_budget_proposal.resource_name, account_budget_proposal.status",
-					"start_date": "2021-01-01",
-				},
-			},
-		},
+			// Note: We assert on substructures (graph.Nodes(), graph.Edges()) because the graph tracks
+			// freed IDs for reuse, which results in an irrelevant inequality between start and expect.
+
+			// sort the nodes by ID
+			// (the slices we get back are from map iteration, where order is not guaranteed)
+			expectNodes := c.expect.graph.Nodes()
+			sort.Slice(expectNodes, func(i, j int) bool {
+				return expectNodes[i].ID() < expectNodes[j].ID()
+			})
+			startNodes := c.start.graph.Nodes()
+			sort.Slice(startNodes, func(i, j int) bool {
+				return startNodes[i].ID() < startNodes[j].ID()
+			})
+			assert.Equal(t, expectNodes, startNodes)
+
+			// sort the edges by from ID, then to ID
+			// (the slices we get back are from map iteration, where order is not guaranteed)
+			expectEdges := c.expect.graph.Edges()
+			sort.Slice(expectEdges, func(i, j int) bool {
+				if expectEdges[i].From().ID() == expectEdges[j].From().ID() {
+					return expectEdges[i].To().ID() < expectEdges[j].To().ID()
+				}
+				return expectEdges[i].From().ID() < expectEdges[j].From().ID()
+			})
+			startEdges := c.start.graph.Edges()
+			sort.Slice(startEdges, func(i, j int) bool {
+				if startEdges[i].From().ID() == startEdges[j].From().ID() {
+					return startEdges[i].To().ID() < startEdges[j].To().ID()
+				}
+				return startEdges[i].From().ID() < startEdges[j].From().ID()
+			})
+			assert.Equal(t, expectEdges, startEdges)
+
+			// vertices is a recursive map, no need to sort
+			assert.Equal(t, c.expect.vertices, c.start.vertices)
+		})
 	}
 }
 
-func GetSources(c *gin.Context) {
-	apiKey := c.Param("key")
-	if apiKey != os.Getenv("JITSU_KEY") {
-		c.JSON(403, gin.H{"error": "Forbidden"})
-		return
-	}
-	sources, err := db.Client.Source.Query().Where(source.HasProjectWith(project.Active(true))).All(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-	}
-	sourcesObj := gin.H{}
-	for _, v := range sources {
-		if v.Type == "fb" {
-			parseFbSource(v, sourcesObj)
+func TestIndex(t *testing.T) {
+	g := NewGraph()
+	g.destinationEdgeThreshold = 3
+
+	a := NewAuthorizer(g, nil, nil)
+
+	addPod := func(podNumber, nodeNumber int) {
+		t.Helper()
+		nodeName := fmt.Sprintf("node%d", nodeNumber)
+		podName := fmt.Sprintf("pod%d", podNumber)
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: "ns", UID: types.UID(fmt.Sprintf("pod%duid1", podNumber))},
+			Spec: corev1.PodSpec{
+				NodeName:                 nodeName,
+				ServiceAccountName:       "sa1",
+				DeprecatedServiceAccount: "sa1",
+				Volumes: []corev1.Volume{
+					{Name: "volume1", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm1"}}}},
+					{Name: "volume2", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm2"}}}},
+					{Name: "volume3", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm3"}}}},
+				},
+			},
 		}
-		if v.Type == "ga" {
-			parseGaSource(v, sourcesObj)
+		g.AddPod(pod)
+		if ok, err := a.hasPathFrom(nodeName, configMapVertexType, "ns", "cm1"); err != nil || !ok {
+			t.Errorf("expected path from %s to cm1, got %v, %v", nodeName, ok, err)
 		}
 	}
-	c.JSON(200, gin.H{"sources": sourcesObj})
-}
 
-type GoogleOauthParams struct {
-	CustomerId string `json:"customerId" binding:"required"`
-	ManagerId  string `json:"managerId"`
-	SourceName string `json:"sourceName" binding:"required"`
-}
+	toString := func(id int) string {
+		for _, namespaceName := range g.vertices {
+			for _, nameVertex := range namespaceName {
+				for _, vertex := range nameVertex {
+					if vertex.id == id {
+						return vertex.String()
+					}
+				}
+			}
+		}
+		return ""
+	}
+	expectGraph := func(expect map[string][]string) {
+		t.Helper()
+		actual := map[string][]string{}
+		for _, node := range g.graph.Nodes() {
+			sortedTo := []string{}
+			for _, to := range g.graph.From(node) {
+				sortedTo = append(sortedTo, toString(to.ID()))
+			}
+			sort.Strings(sortedTo)
+			actual[toString(node.ID())] = sortedTo
+		}
+		if !reflect.DeepEqual(expect, actual) {
+			e, _ := json.MarshalIndent(expect, "", "  ")
+			a, _ := json.MarshalIndent(actual, "", "  ")
+			t.Errorf("expected graph:\n%s\ngot:\n%s", string(e), string(a))
+		}
+	}
+	expectIndex := func(expect map[string][]string) {
+		t.Helper()
+		actual := map[string][]string{}
+		for from, to := range g.destinationEdgeIndex {
+			sortedValues := []string{}
+			for member, count := range to.members {
+				sortedValues = append(sortedValues, fmt.Sprintf("%s=%d", toString(member), count))
+			}
+			sort.Strings(sortedValues)
+			actual[toString(from)] = sortedValues
+		}
+		if !reflect.DeepEqual(expect, actual) {
+			e, _ := json.MarshalIndent(expect, "", "  ")
+			a, _ := json.MarshalIndent(actual, "", "  ")
+			t.Errorf("expected index:\n%s\ngot:\n%s", string(e), string(a))
+		}
+	}
 
-func GetGoogleOauth(c *gin.Context) {
-	var params GoogleOauthParams
-	if err := c.ShouldBindJSON(&params); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
+	for i := 1; i <= g.destinationEdgeThreshold; i++ {
+		addPod(i, i)
+		if i < g.destinationEdgeThreshold {
+			// if we're under the threshold, no index expected
+			expectIndex(map[string][]string{})
+		}
 	}
-	claimsObj, ok := c.Get("project-claims")
-	if !ok {
-		c.JSON(400, gin.H{"error": "missing claims"})
-		return
-	}
-	claims, ok := claimsObj.(*tokens.ProjectToken)
-	if !ok {
-		c.JSON(400, gin.H{"error": "invalid claims"})
-		return
-	}
-	state, _ := nanoid.Nanoid(5)
-	_, err := db.Client.GoogleOauthState.Create().
-		SetID(state).
-		SetCustomerID(params.CustomerId).
-		SetManagerID(params.ManagerId).
-		SetSourceName(params.SourceName).
-		Save(context.Background())
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to create state", "message": err.Error()})
-		return
-	}
-	urlParams := url.Values{}
-	urlParams.Add("client_id", os.Getenv("GA_CLIENT_ID"))
-	urlParams.Add("redirect_uri", os.Getenv("GA_REDIRECT_URI"))
-	urlParams.Add("response_type", "code")
-	urlParams.Add("scope", "https://www.googleapis.com/auth/adwords")
-	urlParams.Add("access_type", "offline")
-	urlParams.Add("prompt", "consent")
-	urlParams.Add("state", claims.ProjectId+state)
-	c.JSON(200, gin.H{"status": "ok", "url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlParams.Encode()})
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"pod:ns/pod1":           {"node:node1"},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"configmap:ns/cm1":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3"},
+		"configmap:ns/cm2":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3"},
+		"configmap:ns/cm3":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm2":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=1", "node:node2=1", "node:node3=1"},
+	})
+
+	// delete one to drop below the threshold
+	g.DeletePod("pod1", "ns")
+	expectGraph(map[string][]string{
+		"node:node2":            {},
+		"node:node3":            {},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"configmap:ns/cm1":      {"pod:ns/pod2", "pod:ns/pod3"},
+		"configmap:ns/cm2":      {"pod:ns/pod2", "pod:ns/pod3"},
+		"configmap:ns/cm3":      {"pod:ns/pod2", "pod:ns/pod3"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod2", "pod:ns/pod3"},
+	})
+	expectIndex(map[string][]string{})
+
+	// add two to get above the threshold
+	addPod(1, 1)
+	addPod(4, 1)
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"pod:ns/pod1":           {"node:node1"},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"pod:ns/pod4":           {"node:node1"},
+		"configmap:ns/cm1":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm2":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm3":      {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod1", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=2", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm2":      {"node:node1=2", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=2", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=2", "node:node2=1", "node:node3=1"},
+	})
+
+	// delete one to remain above the threshold
+	g.DeletePod("pod1", "ns")
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"pod:ns/pod4":           {"node:node1"},
+		"configmap:ns/cm1":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm2":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm3":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm2":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=1", "node:node2=1", "node:node3=1"},
+	})
+
+	// Set node->configmap references
+	g.SetNodeConfigMap("node1", "cm1", "ns")
+	g.SetNodeConfigMap("node2", "cm1", "ns")
+	g.SetNodeConfigMap("node3", "cm1", "ns")
+	g.SetNodeConfigMap("node4", "cm1", "ns")
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"node:node4":            {},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"pod:ns/pod4":           {"node:node1"},
+		"configmap:ns/cm1":      {"node:node1", "node:node2", "node:node3", "node:node4", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm2":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm3":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=2", "node:node2=2", "node:node3=2", "node:node4=1"},
+		"configmap:ns/cm2":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=1", "node:node2=1", "node:node3=1"},
+	})
+
+	// Update node->configmap reference
+	g.SetNodeConfigMap("node1", "cm2", "ns")
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"node:node4":            {},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"pod:ns/pod4":           {"node:node1"},
+		"configmap:ns/cm1":      {"node:node2", "node:node3", "node:node4", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm2":      {"node:node1", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm3":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=1", "node:node2=2", "node:node3=2", "node:node4=1"},
+		"configmap:ns/cm2":      {"node:node1=2", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=1", "node:node2=1", "node:node3=1"},
+	})
+
+	// Remove node->configmap reference
+	g.SetNodeConfigMap("node1", "", "")
+	g.SetNodeConfigMap("node4", "", "")
+	expectGraph(map[string][]string{
+		"node:node1":            {},
+		"node:node2":            {},
+		"node:node3":            {},
+		"node:node4":            {},
+		"pod:ns/pod2":           {"node:node2"},
+		"pod:ns/pod3":           {"node:node3"},
+		"pod:ns/pod4":           {"node:node1"},
+		"configmap:ns/cm1":      {"node:node2", "node:node3", "pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm2":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"configmap:ns/cm3":      {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+		"serviceAccount:ns/sa1": {"pod:ns/pod2", "pod:ns/pod3", "pod:ns/pod4"},
+	})
+	expectIndex(map[string][]string{
+		"configmap:ns/cm1":      {"node:node1=1", "node:node2=2", "node:node3=2"},
+		"configmap:ns/cm2":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"configmap:ns/cm3":      {"node:node1=1", "node:node2=1", "node:node3=1"},
+		"serviceAccount:ns/sa1": {"node:node1=1", "node:node2=1", "node:node3=1"},
+	})
 }

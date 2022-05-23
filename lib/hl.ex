@@ -143,7 +143,7 @@ defmodule Hl do
   ## Examples
 
       iex> Hl.run_regex(["var", "a", "int"])
-      "<span class="kw">var</span><span class="vr">a</span><span class="tp">int</span>"
+      "<span class=\"kw\">var</span><span class=\"vr\">a</span><span class=\"tp\">int</span>"
 
   """
   def run_regex(strings), do: do_run_regex(strings, [])

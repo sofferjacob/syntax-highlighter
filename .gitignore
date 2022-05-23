@@ -24,3 +24,5 @@ syntax_hl-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+nope.ex
